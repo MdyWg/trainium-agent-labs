@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
 """
-prompt.py - the user and agent loop: model takes in a request to generate 
-applicable Verilog code to a given question or given verilog code, debugs it
+prompt.py - the prompt -> code step: model takes in a request to generate
+applicable Verilog code to a given question or given verilog code, and fixes it
+from the verify step's feedback
 
-example prompts: 
+    prompt.py   request -> model -> designs/<module>/design.v + spec.txt
+    verify.py   writes tb.v + report.json; FAIL -> for_feedback.json, PASS -> for_optimize.json
+    prompt.py   --fix reads for_feedback.json -> model -> new design.v -> run verify.py again
+
+example prompts:
   python prompt.py "8-bit ALU with add, sub, and, or, xor"
-  python prompt.py "add an overflow flag" --code alu.v
+  python prompt.py "add an overflow flag" --code alu.v --spec "8-bit ALU ... with an overflow flag"
   python prompt.py                                   -> asks interactively
+  python verify.py designs/alu8                      -> the testbench step
+  python prompt.py --fix designs/alu8                -> fix from designs/alu8/for_feedback.json
 
-response is given as a Verilog module, checking will be handled by
-(vagent.simulate & circuit_checker.py).
-
-Every attempt is graded by vagent's checker/testbench and appended to a JSONL file as prompt, answer and reward, for an RL trainer.
-  --tb my_tb.v     grade with your own testbench instead of an AI-written one
-  --no-check       skip grading (reward is logged as null)
+Every model answer is appended to a JSONL file (prompt, answer, code, folder) for an RL trainer;
+its reward is the score verify.py writes to <folder>/report.json.
 """
 import argparse
 import json
 import os
 import re
-import shutil
 import sys
 import time
+import urllib.request
 
-from vagent import ask, extract, auto_tb, simulate
+URL = os.environ.get("VAGENT_URL", "http://localhost:8000/v1/chat/completions")
+MODEL = os.environ.get("VAGENT_MODEL", "Qwen/Qwen3-8B")
 
-SYSTEM = """You are an expert digital design engineer. The user tells you what circuit they want,
+SYSTEM = """You are an expert digital circuit designer. The user tells you what circuit they want,
 sometimes in a few words ("an ALU", etc.), sometimes as a precise spec, sometimes more open-ended and conceptual,
-and sometimes with existing Verilog they want changed. You reply with one correct,
-synthesizable Verilog module that does what they asked.
+and sometimes with existing Verilog they want changed. You reply with one correct Verilog module that does what they asked.
 
 When the request is vague, choose sensible, conventional defaults (e.g. 8-bit datapath,
 clk + synchronous active-high rst for sequential logic, common operations for an ALU) rather
@@ -49,11 +52,44 @@ Verilog rules (the code is compiled with Icarus Verilog, iverilog -g2012, and sy
   extend operands before adding when the result needs the extra bit.
 - An output assigned inside an always block is declared reg; one driven by assign is a wire.
 - No initial blocks, # delays, $display or $finish in the design.
-- Exactly one module, nothing else.
+- Reply with exactly one module
+"""
 
-Reply with ONLY one ```verilog code block. No explanation before or after it."""
+
+# ---------------- model ----------------
+def ask(user, system=SYSTEM):
+    """One chat request to the model server (vLLM in the seat pod). Returns the reply text."""
+    body = {"model": MODEL, "max_tokens": 2000, "temperature": 0.7,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "chat_template_kwargs": {"enable_thinking": False}}
+    req = urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=900) as r:
+        return json.load(r)["choices"][0]["message"]["content"] or ""
 
 
+def extract(reply):
+    """The Verilog in the reply: the last ```verilog block (or the raw text), minus any
+    testbench (module tb) the model added, which verify.py would see as a second design."""
+    txt = re.sub(r"<think>.*?</think>", "", reply, flags=re.S)
+    blocks = re.findall(r"```(?:verilog|systemverilog|sv|v)?\s*\n(.*?)```", txt, re.S)
+    code = blocks[-1] if blocks else txt
+    code = re.sub(r"^\s*module\s+tb\b.*?\bendmodule\b", "", code, flags=re.S | re.M)
+    return code.strip() + "\n"
+
+
+def module_name(code):
+    """Name of the module; only a 'module' that starts a line, so comments don't count."""
+    m = re.search(r"^\s*module\s+([A-Za-z_]\w*)", code, re.M)
+    return m[1] if m else None
+
+
+def header(code):
+    """'module name(...ports...);' - verify.py builds its testbench against this."""
+    m = re.search(r"^\s*(module\s+\w+\s*(?:#\s*\([^;]*?\)\s*)?\([^)]*\))", code, re.S | re.M)
+    return (m[1] + ";") if m else ""
+
+
+# ---------------- prompts ----------------
 def build_prompt(request, code=None):
     """The user message: a new circuit from a description, or a change to existing code."""
     if code is None:
@@ -71,76 +107,121 @@ Keep the module name and existing ports unless my request says to change them.
 Return the complete updated module."""
 
 
-def generate(request, code=None):
-    """Ask the model for a circuit. Returns (user prompt, raw reply, Verilog source)."""
-    prompt = build_prompt(request, code)
-    reply = ask(prompt, SYSTEM)
-    return prompt, reply, extract(reply).strip() + "\n"
+def fix_prompt(spec, code, fb):
+    """From verify.py's for_feedback.json: the spec, the failing design, and what the test saw."""
+    lines = fb.get("mismatches") or fb.get("result", "").splitlines()
+    shown = "\n".join(lines[:10])
+    return build_prompt(f"""It must do this:
+{spec}
+
+A testbench checked it and it FAILED (score {fb.get('score', 0):.3f}). What the test saw:
+{shown}
+
+Find the cause in the code and fix it. Do not special-case the tested input values.""", code)
 
 
-def grade(request, verilog, tb, log, tag):
-    """Score the circuit with vagent's checker. Returns (reward 0..1 or None, feedback, how).
-    how: 'testbench' (behaviour checked), 'compile-only' (no valid testbench), or 'none'."""
-    if not shutil.which("iverilog"):
-        return None, "iverilog not installed - not checked", "none"
-    if tb is None:
-        print("[ai] writing a testbench from the request...", flush=True)
-        tb = auto_tb(request, verilog, log, tag)
-    reward, feedback, _ = simulate(verilog, tb)
-    return reward, feedback, "testbench" if tb else "compile-only"
+# ---------------- hand-off folder ----------------
+def folder_for(root, name, spec):
+    """designs/<module>/. If that folder already holds a DIFFERENT spec, use <module>_2, _3...
+    so verify.py doesn't reuse a tb.v written for another circuit."""
+    n = 1
+    while True:
+        d = os.path.join(root, name if n == 1 else f"{name}_{n}")
+        sp = os.path.join(d, "spec.txt")
+        if not os.path.exists(sp) or open(sp).read().strip() == spec.strip():
+            return d
+        n += 1
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Describe a circuit, get Verilog back.")
-    ap.add_argument("request", nargs="*", help="what you want, e.g. '4-bit ALU with add/sub/and/or'")
-    ap.add_argument("--code", help="existing Verilog file to modify instead of starting fresh")
-    ap.add_argument("--out", help="save the result here (default: <module name>.v)")
-    ap.add_argument("--tb", help="your own self-checking testbench (module tb) to grade with")
-    ap.add_argument("--no-check", action="store_true", help="don't grade; reward is logged as null")
-    ap.add_argument("--log", default="attempts.jsonl")
-    a = ap.parse_args()
+def log_attempt(path, **rec):
+    with open(path, "a") as f:
+        f.write(json.dumps(dict(time=int(time.time()), system=SYSTEM, **rec)) + "\n")
 
+
+def generate(a):
+    """New design (or a change to --code) -> designs/<module>/design.v + spec.txt."""
     request = " ".join(a.request).strip() or input("What circuit do you want?\n> ").strip()
     if not request:
         sys.exit("nothing requested")
     code = open(a.code).read() if a.code else None
-    tb = open(a.tb).read() if a.tb else None
 
-    print("[ai] generating...", flush=True)
+    prompt = build_prompt(request, code)
+    print("solving...", flush=True)
     t0 = time.time()
     try:
-        prompt, reply, verilog = generate(request, code)
+        reply = ask(prompt)
     except Exception as ex:
         sys.exit(f"request failed: {ex}")
-    seconds = round(time.time() - t0, 1)
+    design = extract(reply)
+    name = module_name(design)
+    if not name:
+        log_attempt(a.log, kind="design", folder=None, request=request, prompt=prompt,
+                    answer=reply, code=design, seconds=round(time.time() - t0, 1))
+        sys.exit("the model's reply has no Verilog module; nothing written (attempt logged)")
 
-    m = re.search(r"\bmodule\s+([A-Za-z_]\w*)", verilog)
-    name = m[1] if m else "circuit"
-    out = a.out or f"{name}.v"
-    if os.path.exists(out) and not a.out:
-        out = f"{name}_new.v"
-    open(out, "w").write(verilog)
-    print("-" * 40 + "\n" + verilog + "-" * 40)
-    print(f"saved to {out}")
+    # spec.txt is what verify.py writes the testbench from: the behaviour + the exact header
+    spec = (a.spec or request) + "\n\nModule header (instantiate exactly): " + header(design)
+    d = folder_for(a.designs, name, spec)
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, "design.v"), "w").write(design)
+    open(os.path.join(d, "spec.txt"), "w").write(spec + "\n")
+    log_attempt(a.log, kind="design", folder=d, request=request, prompt=prompt,
+                answer=reply, code=design, seconds=round(time.time() - t0, 1))
 
-    tag = f"prompt-{name}-{int(t0)}"
-    with open(a.log, "a") as log:
-        if a.no_check:
-            reward, feedback, how = None, "not checked (--no-check)", "none"
-        else:
-            reward, feedback, how = grade(request, verilog, tb, log, tag)
-        log.write(json.dumps(dict(problem=tag, kind="generate", request=request,
-                                  system=SYSTEM, prompt=prompt, answer=reply, code=verilog,
-                                  reward=reward, checked=how, feedback=feedback,
-                                  seconds=seconds)) + "\n")
+    print("-" * 40 + "\n" + design + "-" * 40)
+    print(f"wrote {d}/design.v and spec.txt")
+    print(f"next: python verify.py {d}")
 
-    if reward is None:
-        print(f"reward: not checked - {feedback}")
-    else:
-        print(f"reward: {reward:.3f} ({how}) {feedback.splitlines()[0]}")
-        if reward < 1.0:
-            print("  " + "\n  ".join(feedback.splitlines()[1:6]))
-    print(f"attempt logged to {a.log}")
+
+def fix(a):
+    """--fix designs/<name>: read verify.py's for_feedback.json, ask for a fix, overwrite design.v."""
+    d = a.fix.rstrip("/\\")
+    p = lambda f: os.path.join(d, f)
+    if os.path.exists(p("for_review.json")):
+        sys.exit(f"{d}: verify.py suspects its own testbench (for_review.json) - "
+                 "a human should decide before the design is 'fixed'")
+    if not os.path.exists(p("for_feedback.json")):
+        rep = json.load(open(p("report.json"))) if os.path.exists(p("report.json")) else None
+        if rep and rep.get("passed"):
+            sys.exit(f"{d}: already PASSES (report.json) - nothing to fix")
+        sys.exit(f"{d}: no for_feedback.json - run: python verify.py {d}")
+
+    fb = json.load(open(p("for_feedback.json")))
+    spec = fb.get("spec") or open(p("spec.txt")).read()
+    old = fb.get("design") or open(p("design.v")).read()
+    prompt = fix_prompt(spec, old, fb)
+    print(f"fixing {d} (score {fb.get('score', 0):.3f})...", flush=True)
+    t0 = time.time()
+    try:
+        reply = ask(prompt)
+    except Exception as ex:
+        sys.exit(f"request failed: {ex}")
+    design = extract(reply)
+    log_attempt(a.log, kind="fix", folder=d, request=spec, prompt=prompt, answer=reply,
+                code=design, previous_score=fb.get("score"), seconds=round(time.time() - t0, 1))
+    if module_name(design) != module_name(old):
+        sys.exit(f"the fix renamed the module ({module_name(old)} -> {module_name(design)}); "
+                 "design.v left unchanged (attempt logged)")
+
+    open(p("design_prev.v"), "w").write(old)
+    open(p("design.v"), "w").write(design)
+    os.remove(p("for_feedback.json"))     # used up; verify.py writes a fresh one if it still fails
+    print("-" * 40 + "\n" + design + "-" * 40)
+    print(f"wrote {d}/design.v (previous kept as design_prev.v)")
+    print(f"next: python verify.py {d}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Describe a circuit, get Verilog for the verify step.")
+    ap.add_argument("request", nargs="*", help="what you want, e.g. '4-bit ALU with add/sub/and/or'")
+    ap.add_argument("--code", help="existing Verilog file to modify instead of starting fresh")
+    ap.add_argument("--spec", help="full behaviour for spec.txt (default: the request). "
+                                   "Use it with --code, where the request is only the change")
+    ap.add_argument("--fix", metavar="FOLDER", help="fix designs/<name> from its for_feedback.json")
+    ap.add_argument("--designs", default="designs", help="hand-off folder root (default: designs)")
+    ap.add_argument("--log", default="attempts.jsonl")
+    a = ap.parse_args()
+    fix(a) if a.fix else generate(a)
 
 
 if __name__ == "__main__":
