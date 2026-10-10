@@ -1,128 +1,127 @@
 #!/usr/bin/env python3
 """
-Optimization verification loop. 
+Compare an original Verilog design and an optimized candidate using a
+user-provided testbench.
 
-Each round:
-  1. The generator command is executed.
-  2. The generator outputs THREE files to a target directory:
-       - The original design file (e.g., original.v)
-       - The optimized design file (e.g., optimized.v)
-       - The verification testbench (tb.v)
-  3. This script loads all three components.
-  4. It simulates both the original and optimized designs against the testbench.
-  5. It performs a strict output comparison:
-       - If both designs pass identically -> Success! Loops to next round or saves.
-       - If outputs differ or functional mismatch occurs -> Aborts and returns previous best.
+The exact same testbench is run against both designs. The optimized design is
+selected only if BOTH designs pass the testbench.
+
+Example:
+  python compare_verilog.py --original original.v --optimized optimized.v --tb tb.v
+
+Requirements:
+  - vagent.py must be importable from this script's working directory/PYTHONPATH.
+  - Icarus Verilog (iverilog and vvp) must be installed and on PATH.
 """
-
 import argparse
 import json
-import os
-import subprocess
+import sys
+import time
 from pathlib import Path
 
-# Import the simulation runner from your verification step
 try:
-    from vagent import simulate
-except ImportError:
-    def simulate(design_path, tb_path, judge=True):
-        print(f"[Simulating] {design_path} with {tb_path}")
-        return {"passed": True, "outputs": "mock_success"}
+    import vagent
+except ImportError as exc:
+    raise SystemExit(
+        "Could not import vagent.py. Put this script beside vagent.py "
+        "or add its directory to PYTHONPATH."
+    ) from exc
 
 
-def run_generator_command(template: str, **fields) -> None:
-    """Executes the external generator that generates the code artifacts."""
-    cmd = template.format(**{k: f'"{Path(v).resolve()}"' if isinstance(v, Path) else v
-                             for k, v in fields.items()})
-    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, text=True, errors="replace")
-    if proc.stdout.strip():
-        print(proc.stdout.strip()[-1500:])
-    if proc.returncode != 0:
-        raise RuntimeError(f"Generator command failed (exit {proc.returncode}): {cmd}")
+def read_text(path, label):
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"Cannot read {label} file {path!r}: {exc}") from exc
+    if not content.strip():
+        raise SystemExit(f"The {label} file {path!r} is empty.")
+    return content
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description="Verify and compare generator-produced original vs optimized circuits.")
-    p.add_argument("--generator", required=True,
-                   help='Command triggering the generator. Placeholders: {work_dir} {iteration}')
-    p.add_argument("--top", required=True, help="Top module name")
-    p.add_argument("--max-iterations", type=int, default=5)
-    p.add_argument("--final-json", default="optimization_package.json", help="Output package path")
-    p.add_argument("--work-dir", default="loop_output")
-    args = p.parse_args()
+def evaluate(code, tb):
+    """Call vagent.simulate with Verilog source strings, not file paths."""
+    score, detailed, basic = vagent.simulate(code, tb)
+    score = float(score)
+    return {
+        "score": score,
+        "passed": score == 1.0,
+        "detailed_feedback": detailed,
+        "basic_feedback": basic,
+    }
 
-    work = Path(args.work_dir)
-    work.mkdir(parents=True, exist_ok=True)
 
-    # Tracks the best verified optimization package across rounds
-    last_working_package = None
-    stop_reason = "maximum_iterations_reached"
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--original", required=True, help="Path to original .v source")
+    parser.add_argument("--optimized", required=True, help="Path to optimized candidate .v source")
+    parser.add_argument("--tb", required=True, help="Path to the existing self-checking Verilog testbench")
+    parser.add_argument("--result", default="verification_result.json", help="Output JSON report path")
+    parser.add_argument("--selected", default="selected.v", help="Output path for the selected Verilog design")
+    args = parser.parse_args()
 
-    for i in range(1, args.max_iterations + 1):
-        round_dir = work / f"round_{i}"
-        round_dir.mkdir(parents=True, exist_ok=True)
+    original_path = Path(args.original)
+    optimized_path = Path(args.optimized)
+    tb_path = Path(args.tb)
+    result_path = Path(args.result)
+    selected_path = Path(args.selected)
 
-        print(f"\n--- Iteration {i}: Launching external generator ---")
-        # The generator is expected to output files inside round_dir
-        run_generator_command(args.generator, work_dir=round_dir, iteration=i)
+    original = read_text(original_path, "original design")
+    optimized = read_text(optimized_path, "optimized design")
+    tb = read_text(tb_path, "testbench")
 
-        # Expected files emitted by your generator program
-        orig_v_path = round_dir / "original.v"
-        opt_v_path = round_dir / "optimized.v"
-        tb_path = round_dir / "tb.v"
+    started = time.time()
 
-        if not (orig_v_path.is_file() and opt_v_path.is_file() and tb_path.is_file()):
-            print(f"[Warning] Round {i}: Generator missed creating one or more required files (original.v, optimized.v, tb.v).")
-            stop_reason = "missing_generator_artifacts"
-            break
+    # Both designs are evaluated with precisely the same provided testbench.
+    original_result = evaluate(original, tb)
+    optimized_result = evaluate(optimized, tb)
 
-        print(f"Round {i}: Simulating original design against testbench...")
-        orig_sim = simulate(str(orig_v_path), str(tb_path), judge=True)
-        
-        print(f"Round {i}: Simulating optimized design against testbench...")
-        opt_sim = simulate(str(opt_v_path), str(tb_path), judge=True)
-
-        # 1. Check if both implementations are internally functional
-        if not orig_sim.get("passed", False) or not opt_sim.get("passed", False):
-            print(f"❌ Round {i}: Simulation failure. One or both circuits failed the testbench checks.")
-            stop_reason = "functional_simulation_failure"
-            break
-
-        # 2. Strict Equivalence Check: Compare outputs generated from the testbench
-        # Assumes your simulate framework extracts or captures output match data
-        orig_outputs = orig_sim.get("outputs")
-        opt_outputs = opt_sim.get("outputs")
-
-        if orig_outputs != opt_outputs:
-            print(f"❌ Round {i}: Functional Mismatch! Optimized circuit output differs from original.")
-            stop_reason = "output_mismatch"
-            break
-
-        print(f"  Round {i} Passed! Original and Optimized designs produce identical functional outputs.")
-        
-        # Package the verified round data
-        last_working_package = {
-            "top_module": args.top,
-            "original_design": orig_v_path.read_text(encoding="utf-8"),
-            "optimized_design": opt_v_path.read_text(encoding="utf-8"),
-            "testbench_code": tb_path.read_text(encoding="utf-8"),
-            "verification_status": "MATCH"
-        }
-
-    print(f"\nLoop completed. Exit Reason: {stop_reason}")
-
-    # Write out the final certified JSON package
-    if last_working_package:
-        with open(args.final_json, "w", encoding="utf-8") as f:
-            json.dump(last_working_package, f, indent=2)
-        print(f" Successfully saved the verified equivalent circuit package to {args.final_json}")
-        return 0
+    if original_result["passed"] and optimized_result["passed"]:
+        selected_source = "optimized"
+        selected_code = optimized
+        decision = "optimized_candidate_passed_shared_testbench"
     else:
-        print("❌ Error: No iterations successfully passed verification. No package generated.")
-        return 1
+        selected_source = "original"
+        selected_code = original
+        decision = "kept_original_because_both_designs_did_not_pass"
+
+    selected_path.parent.mkdir(parents=True, exist_ok=True)
+    selected_path.write_text(selected_code, encoding="utf-8")
+
+    result = {
+        "schema_version": 1,
+        "status": "completed",
+        "decision": decision,
+        "selected_source": selected_source,
+        "selected_design": selected_code,
+        "selected_file": str(selected_path),
+        "original_file": str(original_path),
+        "optimized_file": str(optimized_path),
+        "testbench_file": str(tb_path),
+        "testbench": tb,
+        "testbench_generated": False,
+        "original": original_result,
+        "optimized": optimized_result,
+        "optimization_accepted": selected_source == "optimized",
+        "elapsed_seconds": round(time.time() - started, 3),
+        "verification_note": (
+            "Passing the same testbench means both designs passed its checks; "
+            "it does not prove formal equivalence for every possible input."
+        ),
+    }
+
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    print(f"Original score:  {original_result['score']}")
+    print(f"Optimized score: {optimized_result['score']}")
+    print(f"Decision:        {selected_source} ({decision})")
+    print(f"Selected source: {selected_path}")
+    print(f"JSON result:     {result_path}")
+
+    # Nonzero exit code when the optimized candidate is not accepted.
+    return 0 if selected_source == "optimized" else 2
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
+
