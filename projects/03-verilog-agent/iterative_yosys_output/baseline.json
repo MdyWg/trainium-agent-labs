@@ -1,0 +1,218 @@
+{
+  "creator": "Yosys 0.69+274 (git sha1 7513f8df8, Release, GNU /usr/bin/x86_64-w64-mingw32-g++ 15.2.1)",
+  "modules": {
+    "logic_demo": {
+      "attributes": {
+        "top": "00000000000000000000000000000001",
+        "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:3.1-18.10"
+      },
+      "ports": {
+        "a": {
+          "direction": "input",
+          "bits": [ 2 ]
+        },
+        "b": {
+          "direction": "input",
+          "bits": [ 3 ]
+        },
+        "c": {
+          "direction": "input",
+          "bits": [ 4 ]
+        },
+        "d": {
+          "direction": "input",
+          "bits": [ 5 ]
+        },
+        "y": {
+          "direction": "output",
+          "bits": [ 6 ]
+        },
+        "z": {
+          "direction": "output",
+          "bits": [ 7 ]
+        }
+      },
+      "cells": {
+        "$auto$simplemap.cc:106:simplemap_bitop$82": {
+          "hide_name": 1,
+          "type": "$_AND_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:16.47-16.72"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 2 ],
+            "B": [ 3 ],
+            "Y": [ 6 ]
+          }
+        },
+        "$auto$simplemap.cc:106:simplemap_bitop$83": {
+          "hide_name": 1,
+          "type": "$_AND_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17.17-17.32"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 4 ],
+            "B": [ 5 ],
+            "Y": [ 8 ]
+          }
+        },
+        "$auto$simplemap.cc:106:simplemap_bitop$85": {
+          "hide_name": 1,
+          "type": "$_AND_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17.37-17.53"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 4 ],
+            "B": [ 9 ],
+            "Y": [ 10 ]
+          }
+        },
+        "$auto$simplemap.cc:106:simplemap_bitop$86": {
+          "hide_name": 1,
+          "type": "$_OR_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17.16-17.54"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 8 ],
+            "B": [ 10 ],
+            "Y": [ 7 ]
+          }
+        },
+        "$auto$simplemap.cc:46:simplemap_not$84": {
+          "hide_name": 1,
+          "type": "$_NOT_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17.51-17.53"
+          },
+          "port_directions": {
+            "A": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 5 ],
+            "Y": [ 9 ]
+          }
+        }
+      },
+      "netnames": {
+        "$and$C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17$7_Y": {
+          "hide_name": 1,
+          "bits": [ 8 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17.17-17.32"
+          }
+        },
+        "$and$C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17$9_Y": {
+          "hide_name": 1,
+          "bits": [ 10 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17.37-17.53"
+          }
+        },
+        "$not$C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17$8_Y": {
+          "hide_name": 1,
+          "bits": [ 9 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:17.51-17.53"
+          }
+        },
+        "a": {
+          "hide_name": 0,
+          "bits": [ 2 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:4.17-4.18"
+          }
+        },
+        "b": {
+          "hide_name": 0,
+          "bits": [ 3 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:5.17-5.18"
+          }
+        },
+        "c": {
+          "hide_name": 0,
+          "bits": [ 4 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:6.17-6.18"
+          }
+        },
+        "d": {
+          "hide_name": 0,
+          "bits": [ 5 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:7.17-7.18"
+          }
+        },
+        "redundant_a": {
+          "hide_name": 0,
+          "bits": [ 2 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:12.10-12.21"
+          }
+        },
+        "redundant_b": {
+          "hide_name": 0,
+          "bits": [ 3 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:13.10-13.21"
+          }
+        },
+        "same_signal": {
+          "hide_name": 0,
+          "bits": [ 4 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:14.10-14.21"
+          }
+        },
+        "y": {
+          "hide_name": 0,
+          "bits": [ 6 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:8.17-8.18"
+          }
+        },
+        "z": {
+          "hide_name": 0,
+          "bits": [ 7 ],
+          "attributes": {
+            "src": "C:/Users/kktan/Documents/HackTheChipAWS2026/trainium-agent-labs/projects/03-verilog-agent/test_inputs/logic_demo.v:9.17-9.18"
+          }
+        }
+      }
+    }
+  }
+}
