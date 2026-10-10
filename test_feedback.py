@@ -6,10 +6,15 @@ Run with:  python -m pytest test_feedback.py -v
       or:  python test_feedback.py
 """
 
+import json
+import os
+import tempfile
 import unittest
 from feedback import (
     generate_feedback,
     generate_feedback_from_text,
+    generate_feedback_from_file,
+    adapt_teammate_json,
     parse_raw_compiler_text,
     ET_NONE, ET_SYNTAX, ET_FUNCTIONAL, ET_SYNTHESIS, ET_ENVIRONMENT,
     ET_TB_COMPILE, ET_SKIPPED,
@@ -990,6 +995,952 @@ class TestSynthSkipNoteMutuallyExclusive(unittest.TestCase):
         r = generate_feedback(_synth_skipped_result("synthesis disabled by configuration"))
         combined = " ".join(r["suggestions"]).lower()
         self.assertIn("enable", combined)
+
+
+# ---------------------------------------------------------------------------
+# Teammate JSON format — adapt_teammate_json (pure transformation)
+# ---------------------------------------------------------------------------
+
+# The three canonical examples from the spec
+_FUNCTIONAL_DATA = {
+    "name": "binary_to_gray",
+    "spec": "4-bit binary to gray code converter",
+    "design": "module binary_to_gray ... endmodule",
+    "testbench": "...",
+    "score": 0.5,
+    "result": "8 of 16 checks failed.",
+    "mismatches": [
+        "MISMATCH bin=3 expected gray=2 got gray=3",
+        "MISMATCH bin=6 expected gray=5 got gray=7",
+    ],
+}
+
+_COMPILE_DATA = {
+    "name": "binary_to_gray",
+    "score": 0.0,
+    "result": "COMPILE ERROR:\ndut.v:5: syntax error\ndut.v:5: error: Invalid module item.",
+    "mismatches": [],
+}
+
+_TIMEOUT_DATA = {
+    "name": "binary_to_gray",
+    "score": 0.0,
+    "result": "SIMULATION TIMEOUT (likely an infinite loop)",
+    "mismatches": [],
+}
+
+
+class TestAdaptFunctionalMismatches(unittest.TestCase):
+    """Exact functional-mismatch example from the spec."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json(_FUNCTIONAL_DATA)
+
+    def test_not_passed(self):
+        self.assertFalse(self.result["passed"])
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_FUNCTIONAL)
+
+    def test_retry_target(self):
+        self.assertEqual(self.result["retry_target"], "design")
+
+    def test_failing_cases_count(self):
+        self.assertEqual(len(self.result["failing_cases"]), 2)
+
+    def test_first_case_inputs(self):
+        self.assertEqual(self.result["failing_cases"][0]["inputs"], "bin=3")
+
+    def test_first_case_expected(self):
+        self.assertEqual(self.result["failing_cases"][0]["expected"], "gray=2")
+
+    def test_first_case_got(self):
+        self.assertEqual(self.result["failing_cases"][0]["got"], "gray=3")
+
+    def test_second_case_inputs(self):
+        self.assertEqual(self.result["failing_cases"][1]["inputs"], "bin=6")
+
+    def test_second_case_expected(self):
+        self.assertEqual(self.result["failing_cases"][1]["expected"], "gray=5")
+
+    def test_second_case_got(self):
+        self.assertEqual(self.result["failing_cases"][1]["got"], "gray=7")
+
+    def test_raw_errors_are_mismatch_lines(self):
+        self.assertIn("MISMATCH bin=3 expected gray=2 got gray=3", self.result["raw_errors"])
+        self.assertIn("MISMATCH bin=6 expected gray=5 got gray=7", self.result["raw_errors"])
+
+    def test_suggestion_mentions_module_name(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("binary_to_gray", combined)
+
+    def test_suggestion_mentions_gray_code_hint(self):
+        # Gray-code specific hint should fire when "gray" appears in cases
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("gray", combined)
+        self.assertIn("xor", combined)
+
+    def test_schema_complete(self):
+        required = {"passed", "error_type", "raw_errors", "failing_cases",
+                    "source_file", "error_lines", "retry_target", "suggestions"}
+        self.assertEqual(required - set(self.result.keys()), set())
+
+    def test_json_serializable(self):
+        json.dumps(self.result)
+
+
+class TestAdaptCompileError(unittest.TestCase):
+    """Exact compile-error example from the spec."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json(_COMPILE_DATA)
+
+    def test_not_passed(self):
+        self.assertFalse(self.result["passed"])
+
+    def test_error_type(self):
+        # dut.v does not match tb/testbench patterns → design
+        self.assertEqual(self.result["error_type"], ET_SYNTAX)
+
+    def test_retry_target(self):
+        self.assertEqual(self.result["retry_target"], "design")
+
+    def test_source_file(self):
+        self.assertEqual(self.result["source_file"], "dut.v")
+
+    def test_error_lines_count(self):
+        self.assertEqual(len(self.result["error_lines"]), 2)
+
+    def test_error_line_5_syntax(self):
+        el = self.result["error_lines"][0]
+        self.assertEqual(el["file"], "dut.v")
+        self.assertEqual(el["line"], 5)
+        self.assertEqual(el["message"], "syntax error")
+
+    def test_error_line_5_invalid(self):
+        el = self.result["error_lines"][1]
+        self.assertEqual(el["file"], "dut.v")
+        self.assertEqual(el["line"], 5)
+        self.assertIn("Invalid module item", el["message"])
+
+    def test_raw_errors_no_header(self):
+        # "COMPILE ERROR:" header must not appear in raw_errors
+        for e in self.result["raw_errors"]:
+            self.assertNotIn("COMPILE ERROR:", e.upper())
+
+    def test_raw_errors_contain_iverilog_lines(self):
+        self.assertIn("dut.v:5: syntax error", self.result["raw_errors"])
+
+    def test_failing_cases_empty(self):
+        self.assertEqual(self.result["failing_cases"], [])
+
+    def test_suggestion_mentions_syntax(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("syntax", combined)
+
+    def test_schema_complete(self):
+        required = {"passed", "error_type", "raw_errors", "failing_cases",
+                    "source_file", "error_lines", "retry_target", "suggestions"}
+        self.assertEqual(required - set(self.result.keys()), set())
+
+
+class TestAdaptSimulationTimeout(unittest.TestCase):
+    """Exact simulation-timeout example from the spec."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json(_TIMEOUT_DATA)
+
+    def test_not_passed(self):
+        self.assertFalse(self.result["passed"])
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_ENVIRONMENT)
+
+    def test_retry_target(self):
+        self.assertEqual(self.result["retry_target"], "design")
+
+    def test_raw_errors_contains_timeout_string(self):
+        combined = " ".join(self.result["raw_errors"]).upper()
+        self.assertIn("SIMULATION TIMEOUT", combined)
+
+    def test_suggestion_mentions_infinite_loop(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("infinite loop", combined)
+
+    def test_suggestion_mentions_always_block(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("always", combined)
+
+    def test_failing_cases_empty(self):
+        self.assertEqual(self.result["failing_cases"], [])
+
+    def test_schema_complete(self):
+        required = {"passed", "error_type", "raw_errors", "failing_cases",
+                    "source_file", "error_lines", "retry_target", "suggestions"}
+        self.assertEqual(required - set(self.result.keys()), set())
+
+
+class TestAdaptMissingOptionalFields(unittest.TestCase):
+    """Input with only the required 'result' key — all optional fields absent."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json({
+            "result": "2 of 4 checks failed.",
+            "mismatches": ["MISMATCH a=1 expected b=0 got b=1"],
+        })
+
+    def test_not_passed(self):
+        self.assertFalse(self.result["passed"])
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_FUNCTIONAL)
+
+    def test_failing_cases_parsed(self):
+        self.assertEqual(len(self.result["failing_cases"]), 1)
+
+    def test_uses_unknown_name_gracefully(self):
+        # suggestion should not crash when name is missing
+        self.assertIsInstance(self.result["suggestions"], list)
+        self.assertTrue(len(self.result["suggestions"]) > 0)
+
+
+class TestAdaptEmptyMismatches(unittest.TestCase):
+    """result indicates failure but mismatches list is empty."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json({
+            "name": "counter",
+            "result": "3 of 8 checks failed.",
+            "mismatches": [],
+            "score": 0.375,
+        })
+
+    def test_not_passed(self):
+        self.assertFalse(self.result["passed"])
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_FUNCTIONAL)
+
+    def test_no_failing_cases(self):
+        self.assertEqual(self.result["failing_cases"], [])
+
+    def test_raw_errors_contains_result_string(self):
+        self.assertIn("3 of 8 checks failed.", self.result["raw_errors"])
+
+    def test_suggestion_notes_no_mismatches_provided(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("no", combined)  # "no individual mismatches were provided"
+
+
+class TestAdaptScoreOnePerfectRun(unittest.TestCase):
+    """score=1.0, no mismatches — functionally correct but synthesis not checked."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json({
+            "name": "adder",
+            "result": "All 16 checks passed.",
+            "mismatches": [],
+            "score": 1.0,
+        })
+
+    def test_not_passed(self):
+        # Synthesis was not run → must not declare passed=True
+        self.assertFalse(self.result["passed"])
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_SKIPPED)
+
+    def test_suggestion_mentions_synthesis(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("synthesis", combined)
+
+    def test_retry_target_none(self):
+        self.assertIsNone(self.result["retry_target"])
+
+
+class TestAdaptSynthesisNeverReported(unittest.TestCase):
+    """Synthesis is never passed=True from the file adapter."""
+
+    def test_compile_error_never_passes(self):
+        r = adapt_teammate_json(_COMPILE_DATA)
+        self.assertFalse(r["passed"])
+
+    def test_functional_error_never_passes(self):
+        r = adapt_teammate_json(_FUNCTIONAL_DATA)
+        self.assertFalse(r["passed"])
+
+    def test_timeout_never_passes(self):
+        r = adapt_teammate_json(_TIMEOUT_DATA)
+        self.assertFalse(r["passed"])
+
+
+# ---------------------------------------------------------------------------
+# generate_feedback_from_file — file I/O wrapper
+# ---------------------------------------------------------------------------
+
+class TestGenerateFeedbackFromFileSuccess(unittest.TestCase):
+    """Happy path: write a temp input file, call the function, check output."""
+
+    def _run(self, data):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "for_feedback.json")
+            out_path = os.path.join(tmpdir, "feedback_result.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            result = generate_feedback_from_file(in_path, out_path)
+            # Output file must exist and contain valid JSON
+            with open(out_path, "r", encoding="utf-8") as fh:
+                saved = json.load(fh)
+        return result, saved
+
+    def test_functional_output_file_written(self):
+        result, saved = self._run(_FUNCTIONAL_DATA)
+        self.assertEqual(result, saved)
+
+    def test_functional_return_value(self):
+        result, _ = self._run(_FUNCTIONAL_DATA)
+        self.assertEqual(result["error_type"], ET_FUNCTIONAL)
+
+    def test_compile_output_file_written(self):
+        result, saved = self._run(_COMPILE_DATA)
+        self.assertEqual(result, saved)
+
+    def test_compile_return_value(self):
+        result, _ = self._run(_COMPILE_DATA)
+        self.assertEqual(result["error_type"], ET_SYNTAX)
+
+    def test_timeout_output_file_written(self):
+        result, saved = self._run(_TIMEOUT_DATA)
+        self.assertEqual(result, saved)
+
+    def test_output_schema_complete(self):
+        result, _ = self._run(_FUNCTIONAL_DATA)
+        required = {"passed", "error_type", "raw_errors", "failing_cases",
+                    "source_file", "error_lines", "retry_target", "suggestions"}
+        self.assertEqual(required - set(result.keys()), set())
+
+    def test_output_file_is_valid_json(self):
+        _, saved = self._run(_FUNCTIONAL_DATA)
+        # json.load already proved this; just confirm it's a dict
+        self.assertIsInstance(saved, dict)
+
+    def test_original_input_not_modified(self):
+        """The input file must be left unchanged."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "for_feedback.json")
+            out_path = os.path.join(tmpdir, "feedback_result.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                json.dump(_FUNCTIONAL_DATA, fh)
+            before = open(in_path, encoding="utf-8").read()
+            generate_feedback_from_file(in_path, out_path)
+            after = open(in_path, encoding="utf-8").read()
+        self.assertEqual(before, after)
+
+
+class TestGenerateFeedbackFromFileMalformedJSON(unittest.TestCase):
+    """Malformed JSON must raise ValueError, not crash with a raw exception."""
+
+    def test_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "bad.json")
+            out_path = os.path.join(tmpdir, "out.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                fh.write("{not valid json")
+            with self.assertRaises(ValueError):
+                generate_feedback_from_file(in_path, out_path)
+
+    def test_error_message_mentions_malformed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "bad.json")
+            out_path = os.path.join(tmpdir, "out.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                fh.write("not json at all")
+            try:
+                generate_feedback_from_file(in_path, out_path)
+                self.fail("Expected ValueError")
+            except ValueError as exc:
+                self.assertIn("alformed", str(exc))  # "Malformed" or "malformed"
+
+
+class TestGenerateFeedbackFromFileMissingResultKey(unittest.TestCase):
+    """JSON that omits 'result' must raise ValueError."""
+
+    def test_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "no_result.json")
+            out_path = os.path.join(tmpdir, "out.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                json.dump({"name": "foo", "score": 0.0}, fh)
+            with self.assertRaises(ValueError):
+                generate_feedback_from_file(in_path, out_path)
+
+
+class TestGenerateFeedbackFromFileNotADict(unittest.TestCase):
+    """Top-level JSON array must raise ValueError."""
+
+    def test_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "array.json")
+            out_path = os.path.join(tmpdir, "out.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                json.dump(["not", "a", "dict"], fh)
+            with self.assertRaises(ValueError):
+                generate_feedback_from_file(in_path, out_path)
+
+
+class TestGenerateFeedbackFromFileMissingInputFile(unittest.TestCase):
+    """Missing input file must raise OSError."""
+
+    def test_raises_os_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "does_not_exist.json")
+            out_path = os.path.join(tmpdir, "out.json")
+            with self.assertRaises(OSError):
+                generate_feedback_from_file(in_path, out_path)
+
+
+# ---------------------------------------------------------------------------
+# Input validation — adapt_teammate_json and generate_feedback_from_file
+# ---------------------------------------------------------------------------
+
+from feedback import adapt_teammate_json  # already imported above; re-confirm
+
+
+class TestValidateResultType(unittest.TestCase):
+    """'result' must be a string."""
+
+    def test_result_is_int(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": 42, "mismatches": []})
+        self.assertIn("result", str(ctx.exception).lower())
+
+    def test_result_is_none(self):
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": None, "mismatches": []})
+
+    def test_result_is_list(self):
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": ["a", "b"], "mismatches": []})
+
+    def test_result_is_dict(self):
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": {}, "mismatches": []})
+
+
+class TestValidateMismatchesType(unittest.TestCase):
+    """'mismatches' must be a list of strings when present."""
+
+    def test_mismatches_is_string(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "mismatches": "MISMATCH a=1 expected b=0 got b=1"})
+        self.assertIn("mismatches", str(ctx.exception).lower())
+
+    def test_mismatches_is_dict(self):
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": "fail", "mismatches": {}})
+
+    def test_mismatches_contains_int(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "mismatches": ["MISMATCH a=1 expected b=0 got b=1", 99]})
+        self.assertIn("mismatches[1]", str(ctx.exception))
+
+    def test_mismatches_contains_none(self):
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": "fail", "mismatches": [None]})
+
+    def test_mismatches_absent_is_ok(self):
+        # Missing mismatches key should not raise
+        r = adapt_teammate_json({"result": "all passed.", "score": 1.0})
+        self.assertIsInstance(r, dict)
+
+    def test_mismatches_empty_list_is_ok(self):
+        r = adapt_teammate_json({"result": "fail", "mismatches": [], "score": 0.0})
+        self.assertIsInstance(r, dict)
+
+
+class TestValidateScoreType(unittest.TestCase):
+    """'score' must be a finite number in [0, 1] when present."""
+
+    def test_score_is_string(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "score": "0.5"})
+        self.assertIn("score", str(ctx.exception).lower())
+
+    def test_score_is_bool(self):
+        # bool is a subclass of int — must be rejected explicitly
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": "fail", "score": True})
+
+    def test_score_is_none_is_ok(self):
+        # Missing/None score is treated as 0.0 — should not raise
+        r = adapt_teammate_json({"result": "fail", "mismatches": []})
+        self.assertIsInstance(r, dict)
+
+    def test_score_negative(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "score": -0.1})
+        self.assertIn("0 and 1", str(ctx.exception))
+
+    def test_score_above_one(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "score": 1.1})
+        self.assertIn("0 and 1", str(ctx.exception))
+
+    def test_score_infinity(self):
+        import math
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "score": math.inf})
+        self.assertIn("finite", str(ctx.exception).lower())
+
+    def test_score_nan(self):
+        import math
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "score": math.nan})
+        self.assertIn("finite", str(ctx.exception).lower())
+
+    def test_score_zero_is_ok(self):
+        r = adapt_teammate_json({"result": "fail", "mismatches": [], "score": 0.0})
+        self.assertIsInstance(r, dict)
+
+    def test_score_one_is_ok_no_mismatches(self):
+        r = adapt_teammate_json({"result": "passed", "mismatches": [], "score": 1.0})
+        self.assertIsInstance(r, dict)
+
+    def test_score_integer_zero_is_ok(self):
+        r = adapt_teammate_json({"result": "fail", "mismatches": [], "score": 0})
+        self.assertIsInstance(r, dict)
+
+    def test_score_integer_one_is_ok(self):
+        r = adapt_teammate_json({"result": "all passed", "mismatches": [], "score": 1})
+        self.assertIsInstance(r, dict)
+
+
+class TestValidateContradictoryScore(unittest.TestCase):
+    """score=1.0 with non-empty mismatches is a contradictory input."""
+
+    def test_score_one_with_mismatches(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({
+                "result": "all passed",
+                "score": 1.0,
+                "mismatches": ["MISMATCH bin=3 expected gray=2 got gray=3"],
+            })
+        msg = str(ctx.exception).lower()
+        self.assertIn("contradictory", msg)
+
+    def test_score_one_with_multiple_mismatches(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({
+                "result": "fail",
+                "score": 1.0,
+                "mismatches": [
+                    "MISMATCH a=0 expected b=1 got b=0",
+                    "MISMATCH a=1 expected b=0 got b=1",
+                ],
+            })
+        self.assertIn("2", str(ctx.exception))  # mentions count
+
+    def test_score_point_nine_with_mismatches_is_ok(self):
+        # score < 1.0 with mismatches is consistent
+        r = adapt_teammate_json({
+            "result": "fail",
+            "score": 0.9,
+            "mismatches": ["MISMATCH a=0 expected b=1 got b=0"],
+        })
+        self.assertIsInstance(r, dict)
+
+    def test_score_one_integer_with_mismatches(self):
+        # score=1 (int) with mismatches is also contradictory
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({
+                "result": "pass",
+                "score": 1,
+                "mismatches": ["MISMATCH a=0 expected b=1 got b=0"],
+            })
+
+
+class TestValidateViaFile(unittest.TestCase):
+    """Validation errors from adapt_teammate_json are surfaced by generate_feedback_from_file."""
+
+    def _write_and_call(self, data):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "in.json")
+            out_path = os.path.join(tmpdir, "out.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            generate_feedback_from_file(in_path, out_path)
+
+    def test_invalid_result_type_via_file(self):
+        with self.assertRaises(ValueError):
+            self._write_and_call({"result": 123, "mismatches": []})
+
+    def test_contradictory_score_via_file(self):
+        with self.assertRaises(ValueError):
+            self._write_and_call({
+                "result": "pass",
+                "score": 1.0,
+                "mismatches": ["MISMATCH a=0 expected b=1 got b=0"],
+            })
+
+    def test_invalid_score_via_file(self):
+        with self.assertRaises(ValueError):
+            self._write_and_call({"result": "fail", "score": 2.5, "mismatches": []})
+
+    def test_error_message_mentions_filename(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "bad_input.json")
+            out_path = os.path.join(tmpdir, "out.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                json.dump({"result": 99, "mismatches": []}, fh)
+            try:
+                generate_feedback_from_file(in_path, out_path)
+                self.fail("Expected ValueError")
+            except ValueError as exc:
+                self.assertIn("bad_input.json", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Source-analysis tests: design field used to improve suggestions
+# ---------------------------------------------------------------------------
+
+# Gray-code design using OR instead of XOR (wrong)
+_GRAY_OR_DESIGN = """\
+module binary_to_gray(
+    input  [3:0] bin,
+    output [3:0] gray
+);
+    assign gray[3] = bin[3];
+    assign gray[2] = bin[3] | bin[2];
+    assign gray[1] = bin[2] | bin[1];
+    assign gray[0] = bin[1] | bin[0];
+endmodule
+"""
+
+# Gray-code design using XOR (correct)
+_GRAY_XOR_DESIGN = """\
+module binary_to_gray(
+    input  [3:0] bin,
+    output [3:0] gray
+);
+    assign gray[3] = bin[3];
+    assign gray[2] = bin[3] ^ bin[2];
+    assign gray[1] = bin[2] ^ bin[1];
+    assign gray[0] = bin[1] ^ bin[0];
+endmodule
+"""
+
+# Design with a missing semicolon before endmodule (line 8 is the bad line)
+_MISSING_SEMI_DESIGN = """\
+module adder(
+    input  [3:0] a,
+    input  [3:0] b,
+    output [4:0] sum
+);
+    assign sum = a + b
+endmodule
+"""
+
+_GRAY_SPEC = "4-bit binary to gray code converter"
+_ADDER_SPEC = "4-bit adder"
+
+_GRAY_MISMATCHES = [
+    "MISMATCH bin=3 expected gray=2 got gray=3",
+    "MISMATCH bin=6 expected gray=5 got gray=7",
+]
+
+
+class TestGrayCodeOrInsteadOfXor(unittest.TestCase):
+    """Gray-code design using | instead of ^: specific OR→XOR suggestion expected."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json({
+            "name": "binary_to_gray",
+            "spec": _GRAY_SPEC,
+            "design": _GRAY_OR_DESIGN,
+            "result": "8 of 16 checks failed.",
+            "mismatches": _GRAY_MISMATCHES,
+            "score": 0.5,
+        })
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_FUNCTIONAL)
+
+    def test_or_xor_suggestion_present(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("|", combined)
+        self.assertIn("^", combined)
+        self.assertIn("replace", combined)
+
+    def test_suggestion_cites_a_source_line(self):
+        # Should mention at least one "line N:" reference
+        combined = " ".join(self.result["suggestions"])
+        self.assertRegex(combined, r"line \d+")
+
+    def test_suggestion_does_not_mention_wrong_module(self):
+        # Should not fire generic adder hints
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertNotIn("carry bit", combined)
+
+    def test_retry_target(self):
+        self.assertEqual(self.result["retry_target"], "design")
+
+    def test_failing_cases_preserved(self):
+        self.assertEqual(len(self.result["failing_cases"]), 2)
+
+
+class TestGrayCodeXorNoFalseWarning(unittest.TestCase):
+    """Gray-code design already using ^: no OR warning should appear."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json({
+            "name": "binary_to_gray",
+            "spec": _GRAY_SPEC,
+            "design": _GRAY_XOR_DESIGN,
+            "result": "1 of 16 checks failed.",
+            "mismatches": ["MISMATCH bin=1 expected gray=1 got gray=0"],
+            "score": 0.9375,
+        })
+
+    def test_no_or_xor_suggestion(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertNotIn("replace '|' with '^'", combined)
+
+    def test_still_has_generic_suggestion(self):
+        # Generic mismatch suggestion must still appear
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("mismatch", combined)
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_FUNCTIONAL)
+
+
+class TestNonGrayModuleNoOrWarning(unittest.TestCase):
+    """A non-Gray-code module using | in assigns: no OR warning (spec has no 'gray')."""
+
+    def setUp(self):
+        # An OR-based design for a non-gray module
+        design = """\
+module flag_or(input a, input b, output f);
+    assign f = a | b;
+endmodule
+"""
+        self.result = adapt_teammate_json({
+            "name": "flag_or",
+            "spec": "simple OR gate",
+            "design": design,
+            "result": "1 of 4 checks failed.",
+            "mismatches": ["MISMATCH a=0 expected f=0 got f=1"],
+            "score": 0.75,
+        })
+
+    def test_no_or_xor_suggestion(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertNotIn("replace '|' with '^'", combined)
+        self.assertNotIn("gray", combined)
+
+
+class TestCompileMissingSemicolon(unittest.TestCase):
+    """Compile error with design source showing a missing semicolon before endmodule."""
+
+    def setUp(self):
+        # Error reported on line 7 (endmodule), bad statement is on line 6
+        self.result = adapt_teammate_json({
+            "name": "adder",
+            "spec": _ADDER_SPEC,
+            "design": _MISSING_SEMI_DESIGN,
+            "result": (
+                "COMPILE ERROR:\n"
+                "dut.v:7: syntax error\n"
+                "dut.v:7: error: Invalid module item."
+            ),
+            "mismatches": [],
+            "score": 0.0,
+        })
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_SYNTAX)
+
+    def test_specific_semicolon_suggestion(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("semicolon", combined)
+
+    def test_suggestion_cites_source_line(self):
+        combined = " ".join(self.result["suggestions"])
+        self.assertRegex(combined, r"[Ll]ine \d+")
+
+    def test_suggestion_quotes_offending_statement(self):
+        # The offending statement text should appear in the suggestion
+        combined = " ".join(self.result["suggestions"])
+        self.assertIn("assign sum = a + b", combined)
+
+    def test_original_error_preserved(self):
+        self.assertIn("dut.v:7: syntax error", self.result["raw_errors"])
+
+    def test_retry_target(self):
+        self.assertEqual(self.result["retry_target"], "design")
+
+
+class TestCompileNoDesignSource(unittest.TestCase):
+    """Compile error without design source: generic fallback must still be present."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json({
+            "name": "adder",
+            "result": (
+                "COMPILE ERROR:\n"
+                "dut.v:5: syntax error\n"
+                "dut.v:5: error: Invalid module item."
+            ),
+            "mismatches": [],
+            "score": 0.0,
+            # No "design" key
+        })
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_SYNTAX)
+
+    def test_generic_suggestion_present(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertTrue(
+            "syntax" in combined or "compile" in combined or "design" in combined,
+            f"Expected generic suggestion, got: {combined!r}",
+        )
+
+    def test_raw_errors_preserved(self):
+        self.assertIn("dut.v:5: syntax error", self.result["raw_errors"])
+
+
+class TestTestbenchCompileError(unittest.TestCase):
+    """Compile error in tb.v: retry_target must be 'testbench', not 'design'."""
+
+    def setUp(self):
+        self.result = adapt_teammate_json({
+            "name": "adder",
+            "design": _MISSING_SEMI_DESIGN,   # design present but error is in tb.v
+            "result": (
+                "COMPILE ERROR:\n"
+                "tb.v:12: syntax error\n"
+                "tb.v:12: error: Malformed statement"
+            ),
+            "mismatches": [],
+            "score": 0.0,
+        })
+
+    def test_error_type(self):
+        self.assertEqual(self.result["error_type"], ET_TB_COMPILE)
+
+    def test_retry_target(self):
+        self.assertEqual(self.result["retry_target"], "testbench")
+
+    def test_suggestion_targets_testbench(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertIn("testbench", combined)
+
+    def test_suggestion_does_not_say_fix_design(self):
+        combined = " ".join(self.result["suggestions"]).lower()
+        self.assertNotIn("fix the design", combined)
+        self.assertNotIn("resubmit the design", combined)
+
+    def test_source_file_is_tb(self):
+        self.assertEqual(self.result["source_file"], "tb.v")
+
+    def test_no_semicolon_suggestion_for_tb_error(self):
+        # Source analysis of design must not fire when error is in tb.v
+        combined = " ".join(self.result["suggestions"]).lower()
+        # The specific "assign sum = a + b" line from _MISSING_SEMI_DESIGN
+        # must not appear — that's a design-file detail irrelevant to tb errors
+        self.assertNotIn("assign sum = a + b", combined)
+
+
+class TestInvalidDesignSpecTestbenchFields(unittest.TestCase):
+    """'design', 'spec', and 'testbench' must be strings when present."""
+
+    def test_design_is_int(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "design": 42})
+        self.assertIn("design", str(ctx.exception).lower())
+
+    def test_design_is_list(self):
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": "fail", "design": ["line1"]})
+
+    def test_design_is_none_ok(self):
+        # None / absent is allowed — treated as empty
+        r = adapt_teammate_json({"result": "fail", "mismatches": [], "score": 0.0})
+        self.assertIsInstance(r, dict)
+
+    def test_spec_is_int(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "spec": 7})
+        self.assertIn("spec", str(ctx.exception).lower())
+
+    def test_spec_is_dict(self):
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": "fail", "spec": {}})
+
+    def test_testbench_is_int(self):
+        with self.assertRaises(ValueError) as ctx:
+            adapt_teammate_json({"result": "fail", "testbench": 99})
+        self.assertIn("testbench", str(ctx.exception).lower())
+
+    def test_testbench_is_list(self):
+        with self.assertRaises(ValueError):
+            adapt_teammate_json({"result": "fail", "testbench": [1, 2]})
+
+    def test_testbench_absent_ok(self):
+        r = adapt_teammate_json({"result": "fail", "mismatches": [], "score": 0.0})
+        self.assertIsInstance(r, dict)
+
+
+class TestSchemaAndSavingWithDesignField(unittest.TestCase):
+    """Output schema is preserved when design/spec/testbench are provided."""
+
+    REQUIRED_KEYS = {"passed", "error_type", "raw_errors", "failing_cases",
+                     "source_file", "error_lines", "retry_target", "suggestions"}
+
+    def _full_data(self):
+        return {
+            "name": "binary_to_gray",
+            "spec": _GRAY_SPEC,
+            "design": _GRAY_OR_DESIGN,
+            "testbench": "// testbench source here",
+            "result": "8 of 16 checks failed.",
+            "mismatches": _GRAY_MISMATCHES,
+            "score": 0.5,
+        }
+
+    def test_schema_complete(self):
+        r = adapt_teammate_json(self._full_data())
+        missing = self.REQUIRED_KEYS - set(r.keys())
+        self.assertEqual(missing, set())
+
+    def test_json_serializable(self):
+        r = adapt_teammate_json(self._full_data())
+        json.dumps(r)
+
+    def test_output_file_written_correctly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "for_feedback.json")
+            out_path = os.path.join(tmpdir, "feedback_result.json")
+            with open(in_path, "w", encoding="utf-8") as fh:
+                json.dump(self._full_data(), fh)
+            result = generate_feedback_from_file(in_path, out_path)
+            self.assertTrue(os.path.exists(out_path))
+            with open(out_path, encoding="utf-8") as fh:
+                saved = json.load(fh)
+            self.assertEqual(result, saved)
+
+    def test_input_file_not_modified(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path  = os.path.join(tmpdir, "for_feedback.json")
+            out_path = os.path.join(tmpdir, "feedback_result.json")
+            data = self._full_data()
+            with open(in_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            before = open(in_path, encoding="utf-8").read()
+            generate_feedback_from_file(in_path, out_path)
+            after = open(in_path, encoding="utf-8").read()
+            self.assertEqual(before, after)
 
 
 # ---------------------------------------------------------------------------
