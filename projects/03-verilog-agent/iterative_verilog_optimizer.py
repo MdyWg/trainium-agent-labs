@@ -1,248 +1,149 @@
 #!/usr/bin/env python3
-"""
-Iteratively ask the Qwen model configured in vagent.py to optimize Verilog,
-then use Yosys (without ABC) to compare the candidate against the current best.
-
-Loop:
-  1. Measure the current best with Yosys synth -noabc.
-  2. Send the current Verilog plus optimization feedback to Qwen via vagent.ask().
-  3. Measure the generated candidate using the same Yosys flow.
-  4. Accept only a candidate with fewer generic synthesized cells, then loop again.
-  5. Stop on a tie, a larger candidate, or the iteration limit.
-  6. Save the best original Verilog source for a separate testbench.
-
-Keep vagent.py (including its AWS/Qwen endpoint configuration) beside this script.
-This script does not run a testbench or prove equivalence.
-"""
+"""Loop: ask an external generator program for a new circuit, compare it with
+the current best by Yosys generic cell count (synth -noabc), keep the smaller,
+and repeat until the new circuit is about the same size as the best.
+Does NOT check functional equivalence."""
 
 import argparse
 import json
-import re
 import shutil
 import subprocess
-import vagent as base
 from pathlib import Path
 
 
-def quote_yosys_path(path: Path) -> str:
-    value = str(path.resolve()).replace("\\", "/")
-    return '"' + value.replace('"', '\\"') + '"'
+def q(path: Path) -> str:
+    return '"' + str(path.resolve()).replace("\\", "/") + '"'
 
 
-def run_yosys(script: str, log_path: Path) -> tuple[int, str]:
-    proc = subprocess.run(
-        ["yosys", "-p", script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-    )
-    log_path.write_text(proc.stdout, encoding="utf-8")
-    return proc.returncode, proc.stdout
-
-
-def get_stats(json_path: Path, top: str) -> tuple[int, dict[str, int]]:
-    data = json.loads(json_path.read_text(encoding="utf-8"))
-    modules = data.get("modules", {})
-    if top not in modules:
-        raise RuntimeError(
-            f"Top module {top!r} not found in {json_path}. "
-            f"Found modules: {', '.join(modules.keys()) or '(none)'}"
-        )
-    cells = modules[top].get("cells", {})
-    types: dict[str, int] = {}
-    for cell in cells.values():
-        kind = cell.get("type", "(unknown)")
-        types[kind] = types.get(kind, 0) + 1
-    return len(cells), types
-
-
-def synthesize(source: Path, top: str, work_dir: Path, label: str) -> dict:
+def measure(source: Path, top: str, work_dir: Path, label: str) -> int:
     json_path = work_dir / f"{label}.json"
-    netlist_path = work_dir / f"{label}_synthesized.v"
-    log_path = work_dir / f"{label}.log"
-
-    # Disable ABC: Qwen proposes the rewrites; Yosys measures them consistently.
     script = (
-        f"read_verilog -sv {quote_yosys_path(source)}; "
+        f"read_verilog -sv {q(source)}; "
         f"hierarchy -check -top {top}; "
         f"synth -noabc -top {top} -flatten; "
         "stat; "
-        f"write_json {quote_yosys_path(json_path)}; "
-        f"write_verilog -noattr -noexpr {quote_yosys_path(netlist_path)}"
+        f"write_json {q(json_path)}"
     )
-    rc, output = run_yosys(script, log_path)
-    if rc != 0:
-        raise RuntimeError(
-            f"Yosys failed on {source}. See {log_path}.\n{output[-2500:]}"
-        )
-    count, types = get_stats(json_path, top)
-    return {
-        "source": str(source.resolve()),
-        "cell_count": count,
-        "cell_types": types,
-        "netlist": str(netlist_path.resolve()),
-        "log": str(log_path.resolve()),
-    }
+    proc = subprocess.run(["yosys", "-p", script], stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, errors="replace")
+    (work_dir / f"{label}.log").write_text(proc.stdout, encoding="utf-8")
+    if proc.returncode != 0:
+        raise RuntimeError(f"Yosys failed on {source}\n{proc.stdout[-1500:]}")
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    if top not in data.get("modules", {}):
+        raise RuntimeError(f"Top module {top!r} not found in {source}")
+    return len(data["modules"][top].get("cells", {}))
 
 
-def valid_identifier(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", value))
+def run_generator(template: str, inp: Path, out: Path, top: str, iteration: int) -> None:
+    """Run the external program that writes a new circuit to `out`."""
+    if out.exists():
+        out.unlink()
+    cmd = template.format(input=f'"{inp.resolve()}"', output=f'"{out.resolve()}"',
+                          top=top, iteration=iteration)
+    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, errors="replace")
+    if proc.stdout.strip():
+        print(proc.stdout.strip()[-1500:])
+    if proc.returncode != 0:
+        raise RuntimeError(f"Generator command failed (exit {proc.returncode}).")
+    if not out.is_file():
+        raise RuntimeError("Generator ran but did not write the output file.")
 
-
-def call_qwen_optimizer(current: Path, candidate: Path, iteration: int,
-                        work_dir: Path, current_metrics: dict) -> None:
-    """Ask the Qwen model configured by vagent.py for a Verilog rewrite."""
-    candidate.parent.mkdir(parents=True, exist_ok=True)
-    if candidate.exists():
-        candidate.unlink()
-
-    current_code = current.read_text(encoding="utf-8")
-    cell_types = ", ".join(
-        f"{name}: {count}" for name, count in sorted(current_metrics["cell_types"].items())
-    ) or "no cells"
-    prompt = (
-        "You are optimizing synthesizable Verilog for lower hardware cost. "
-        "Return ONLY the complete replacement Verilog module, preferably in one "
-        "```verilog code block. Preserve the exact behavior, top module name, "
-        "port names, port directions, and port widths. Do not add a testbench, "
-        "explanation, or additional modules unless the original requires them. "
-        "Do not optimize by changing the external interface.\n\n"
-        f"Iteration: {iteration}\n"
-        f"Current Yosys generic cell count (ABC disabled): {current_metrics['cell_count']}\n"
-        f"Current cell types: {cell_types}\n\n"
-        "Try to reduce redundant logic, unnecessary muxes, and avoidable hardware. "
-        "If you cannot identify a safe improvement, still return your best "
-        "conservative rewrite. Do not claim equivalence has been proven.\n\n"
-        f"Current Verilog:\n```verilog\n{current_code}\n```"
-    )
-
-    print(f"\nSending current circuit to Qwen for iteration {iteration}...")
-    reply = base.ask(prompt)
-    code = base.extract(reply)
-    if not code or not re.search(r"\bmodule\s+[A-Za-z_$][\w$]*", code):
-        raise RuntimeError(
-            "Qwen did not return recognizable Verilog. Check vagent.py's AWS/Qwen "
-            "configuration and the model response."
-        )
-    candidate.write_text(code.rstrip() + "\n", encoding="utf-8")
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Repeatedly ask Qwen to optimize Verilog until no cell-count improvement is found."
-    )
-    parser.add_argument("--start", required=True, help="Starting Verilog source file")
-    parser.add_argument("--top", required=True, help="Top module name")
-    parser.add_argument("--max-iterations", type=int, default=10,
-                        help="Maximum optimizer calls (default: 10)")
-    parser.add_argument("--out", default="selected_circuit.v",
-                        help="Final selected original source (default: selected_circuit.v)")
-    parser.add_argument("--report", default="optimization_report.json",
-                        help="JSON report (default: optimization_report.json)")
-    parser.add_argument("--work-dir", default="iterative_yosys_output",
-                        help="Intermediate files directory")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Iteratively compare generated Verilog circuits by cell count.")
+    p.add_argument("--start", required=True, help="Original Verilog file")
+    p.add_argument("--top", required=True, help="Top module name")
+    p.add_argument("--generator", required=True,
+                   help='Command that creates a circuit. Use {input} {output} {top} {iteration}, '
+                        'e.g. "python qwen_generator.py --input {input} --output {output} --top {top}"')
+    p.add_argument("--tolerance", type=int, default=0,
+                   help="Stop when new and best cell counts differ by this much or less (default 0)")
+    p.add_argument("--max-iterations", type=int, default=10)
+    p.add_argument("--out", default="selected_circuit.v", help="Where the most optimized circuit is saved")
+    p.add_argument("--report", default="optimization_report.json")
+    p.add_argument("--work-dir", default="loop_output")
+    args = p.parse_args()
 
-    if not valid_identifier(args.top):
-        parser.error("--top must be a valid Verilog identifier.")
-    if args.max_iterations < 1:
-        parser.error("--max-iterations must be at least 1.")
     if not shutil.which("yosys"):
         print("ERROR: Yosys was not found on PATH.")
         return 2
-
-    start = Path(args.start).resolve()
+    start = Path(args.start)
     if not start.is_file():
-        print(f"ERROR: starting file does not exist: {start}")
+        print(f"ERROR: starting file does not exist: {start.resolve()}")
         return 2
 
-    work_dir = Path(args.work_dir).resolve()
-    work_dir.mkdir(parents=True, exist_ok=True)
+    work = Path(args.work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+
+    # The three files: original (never changes), best (updated), candidate (new each round)
+    original = work / "original.v"
+    best = work / "best.v"
+    shutil.copyfile(start, original)
+    shutil.copyfile(start, best)
+
     history = []
-    current_best = start
     try:
-        best_result = synthesize(current_best, args.top, work_dir, "baseline")
-        history.append({
-            "iteration": 0, "status": "baseline", **best_result
-        })
-        print(f"Starting circuit: {current_best}")
-        print(f"Starting generic cell count: {best_result['cell_count']}")
+        original_count = measure(original, args.top, work, "original")
+        best_count = original_count
+        print(f"Original circuit: {original_count} cells")
 
         stop_reason = "maximum_iterations_reached"
-        for iteration in range(1, args.max_iterations + 1):
-            candidate = work_dir / f"candidate_{iteration}.v"
-            call_qwen_optimizer(
-                current_best, candidate, iteration, work_dir, best_result
-            )
-            candidate_result = synthesize(
-                candidate, args.top, work_dir, f"candidate_{iteration}"
-            )
-            candidate_count = candidate_result["cell_count"]
-            best_count = best_result["cell_count"]
+        for i in range(1, args.max_iterations + 1):
+            candidate = work / f"candidate_{i}.v"
+            print(f"\n--- Iteration {i}: requesting a new circuit ---")
+            run_generator(args.generator, best, candidate, args.top, i)
 
-            entry = {
-                "iteration": iteration,
-                "candidate": candidate_result,
-                "current_best_cell_count": best_count,
-            }
-
-            print(f"Candidate cell count: {candidate_count}")
-            print(f"Current best cell count: {best_count}")
-
-            if candidate_count < best_count:
-                print("IMPROVEMENT: accepting candidate and looping again.")
-                entry["status"] = "accepted_improvement"
-                history.append(entry)
-                current_best = candidate
-                best_result = candidate_result
+            try:
+                cand_count = measure(candidate, args.top, work, f"candidate_{i}")
+            except Exception as exc:
+                print(f"Candidate rejected (Yosys could not process it): {exc}")
+                history.append({"iteration": i, "status": "rejected_yosys_error"})
                 continue
 
-            if candidate_count == best_count:
-                print("TIE: no measured hardware improvement; stopping.")
-                entry["status"] = "tie_stop"
-                stop_reason = "candidate_tied_current_best"
+            diff = abs(cand_count - best_count)
+            print(f"New circuit: {cand_count} cells | Current best: {best_count} cells")
+
+            if cand_count < best_count:
+                print("New circuit is smaller: updating best.")
+                shutil.copyfile(candidate, best)
+                status = "improved"
+                best_count = cand_count
             else:
-                print("NO IMPROVEMENT: candidate is larger; stopping.")
-                entry["status"] = "larger_stop"
-                stop_reason = "candidate_larger_than_current_best"
-            history.append(entry)
-            break
+                print("Keeping current best.")
+                status = "not_better"
+            history.append({"iteration": i, "candidate_cells": cand_count,
+                            "best_cells_after": best_count, "status": status})
 
-        out_path = Path(args.out).resolve()
+            if diff <= args.tolerance:
+                print(f"Circuits are within {args.tolerance} cell(s) of each other: stopping.")
+                stop_reason = "converged"
+                break
+
+        out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(current_best, out_path)
+        shutil.copyfile(best, out_path)
 
-        report_path = Path(args.report).resolve()
-        report_path.parent.mkdir(parents=True, exist_ok=True)
+        saved = (1 - best_count / original_count) * 100 if original_count else 0.0
         report = {
-            "metric": "generic_synthesized_cell_count_after_yosys_synth_noabc",
-            "optimizer": "Qwen via vagent.py AWS/API configuration",
-            "top_module": args.top,
-            "starting_file": str(start),
-            "selected_file": str(out_path),
-            "best_cell_count": best_result["cell_count"],
-            "best_cell_types": best_result["cell_types"],
+            "original_file": str(original.resolve()),
+            "original_cell_count": original_count,
+            "most_optimized_file": str(out_path.resolve()),
+            "most_optimized_cell_count": best_count,
+            "reduction_percent": round(saved, 1),
             "stop_reason": stop_reason,
-            "max_iterations": args.max_iterations,
             "history": history,
-            "functional_correctness_checked": False,
             "equivalence_checked": False,
-            "warning": (
-                "Qwen-generated Verilog has not been proven equivalent. "
-                "A lower cell count does not prove functional equivalence. "
-                "Run the selected file through your separate testbench/formal "
-                "equivalence process before accepting it for use. A tie or a "
-                "non-improving candidate does not prove global optimality."
-            ),
         }
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        Path(args.report).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-        print("\n=== Finished ===")
-        print(f"Selected circuit: {out_path}")
-        print(f"Best cell count: {best_result['cell_count']}")
-        print(f"Stop reason: {stop_reason}")
-        print(f"Report: {report_path}")
-        print("Next: send selected_circuit.v to your separate testbench.")
+        print("\n=== Final result ===")
+        print(f"Original circuit:       {original.resolve()}  ->  {original_count} cells")
+        print(f"Most optimized circuit: {out_path.resolve()}  ->  {best_count} cells")
+        print(f"Reduction: {saved:.1f}%  |  Stop reason: {stop_reason}")
+        print(f"Report: {Path(args.report).resolve()}")
+        print("Note: equivalence NOT checked. Run your testbench on the optimized circuit.")
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}")
