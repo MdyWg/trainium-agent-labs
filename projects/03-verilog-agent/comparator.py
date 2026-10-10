@@ -145,5 +145,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD:projects/03-verilog-agent/iterative_verilog_optimizer.py
     import sys
     sys.exit(main())
+=======
+    raise SystemExit(main())
+>>>>>>> 78b728ccfcb0a3c87caedfd7d5b0d7eb31058c9f:projects/03-verilog-agent/comparator.py
